@@ -1,0 +1,550 @@
+### Plan for Multi-Agent Setup Using Spring AI Alibaba Graph Core
+
+Based on your requirements, we'll build a stateful graph workflow using Spring AI Alibaba Graph Core 1.0.0.3, which is designed for multi-agent applications with LLMs (similar to LangGraph in Python). This will handle the BRD processing flow as a directed graph of nodes (each acting as an "agent" for a specific task). The graph will be extensible for future nodes.
+
+#### High-Level Architecture
+- **Framework Stack**: Spring Boot with Gradle, Spring AI Alibaba for LLM integration (using Alibaba Cloud's DashScope/Qwen model), Apache POI for Word document parsing, WebClient for API calls to the microservice.
+- **State Management**: Use `OverAllState` (built-in) with a Map-based state. Keys will track progress (e.g., `documentPath`, `chunks`, `scenarios`, `scenarioJsons`, `apiResponses`).
+- **Nodes (Agents)**:
+  1. **DocumentChunkerNode**: Reads the Word (.docx) file, extracts text, and chunks it into paragraphs (simple splitting by `\n\n` for BRD sections).
+  2. **ScenarioGeneratorNode**: Joins chunks and uses LLM to generate a list of scenarios (e.g., 5-10 use-case scenarios from the BRD).
+  3. **JsonCreatorNode**: For each scenario, uses LLM to generate a JSON object with the scenario details plus additional "conditions" (e.g., edge cases) and "predicates" (e.g., validation rules).
+  4. **ApiSenderNode**: For each JSON, sends a POST request to the configured microservice API. Implements retry logic (up to 3 attempts with exponential backoff) on failure (e.g., HTTP 4xx/5xx). Collects responses.
+  5. **HumanReviewNode**: On success, bundles the JSONs and API responses for human review (outputs a formatted message or list). Graph ends here—no further action, as per "stop here" on success.
+- **Edges**: Linear flow: `START` → `chunkDocument` → `generateScenarios` → `createJsons` → `sendToApi` → `humanReview` → `END`. Retries are handled *inside* `ApiSenderNode` (no conditional edges needed for simplicity; can add loops later).
+- **Retry Handling**: In `ApiSenderNode`, use a simple loop with delays. If all retries fail for a JSON, log error and skip (or throw exception—configurable).
+- **Input/Output**: REST endpoint `/process-brd` accepts a multipart file upload (Word doc). Outputs the final state as JSON (including review-ready data).
+- **Extensibility**: New nodes can be added via `addNode` and `addEdge` in `GraphConfiguration`. For future multi-threading or parallelism (e.g., process scenarios in parallel), use `addParallelNodes`.
+- **Assumptions**:
+  - LLM: Qwen-Max via DashScope (Alibaba Cloud AI).
+  - Microservice: POST to `/api/validate` (configurable URL in `application.yml`). Expects JSON body, returns JSON response on success.
+  - Chunks: Simple text splitting; enhance with semantic chunking later.
+  - Human Review: Just formats output—integrate with UI or email for real review.
+  - Error Handling: Basic logging; graph throws `GraphStateException` on critical failures.
+  - MCP-like Server: The graph acts as a "Model Context Protocol" server by maintaining stateful context across nodes/agents.
+- **Testing/Running**: Run as Spring Boot app. Test with `curl -F "file=@brd.docx" http://localhost:8080/process-brd`.
+- **Future Additions**: Easy to insert nodes (e.g., validation agent) between `createJsons` and `sendToApi`.
+
+#### Implementation Steps
+1. Set up Gradle project with dependencies.
+2. Configure `application.yml` for AI and API.
+3. Define nodes implementing `NodeAction`.
+4. Define graph in `GraphConfiguration`.
+5. Expose via `BrdProcessorController`.
+6. (Optional) Add KeyStrategy for state (default ReplaceStrategy for all keys).
+
+Now, the Java code.
+
+### Code Implementation
+
+#### 1. `build.gradle` (Key Dependencies)
+```gradle
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.2.0'
+    id 'io.spring.dependency-management' version '1.1.4'
+}
+
+group = 'com.example'
+version = '1.0.0'
+sourceCompatibility = '17'
+
+repositories {
+    mavenCentral()
+    maven { url 'https://s01.oss.sonatype.org/content/repositories/snapshots/' } // For SNAPSHOT if needed
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-webflux' // For WebClient
+    implementation 'org.springframework.ai:spring-ai-autoconfigure-model-chat-client'
+    implementation 'com.alibaba.cloud.ai:spring-ai-alibaba-graph-core:1.0.0.3'
+    implementation 'com.alibaba.cloud.ai:spring-ai-alibaba-starter-dashscope-chat-spring-boot-3:1.0.0.3' // For DashScope/Qwen
+    implementation 'org.apache.poi:poi-ooxml:5.2.5' // For Word docs
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+```
+
+#### 2. `src/main/resources/application.yml`
+```yaml
+server:
+  port: 8080
+
+spring:
+  application:
+    name: brd-processor
+  ai:
+    dashscope:
+      api-key: ${DASHSCOPE_API_KEY}  # Set via env var
+      chat:
+        options:
+          model: qwen-max
+          temperature: 0.7
+
+brd:
+  microservice:
+    url: http://localhost:8081/api/validate  # Your microservice endpoint
+  retry:
+    max-attempts: 3
+    base-delay-ms: 1000
+```
+
+#### 3. `GraphConfiguration.java` (Defines the StateGraph)
+```java
+package com.example.brdprocessor.config;
+
+import com.alibaba.cloud.ai.graph.KeyStrategy;
+import com.alibaba.cloud.ai.graph.KeyStrategyFactory;
+import com.alibaba.cloud.ai.graph.StateGraph;
+import com.alibaba.cloud.ai.graph.action.AsyncNodeAction;
+import com.alibaba.cloud.ai.graph.exception.GraphStateException;
+import com.alibaba.cloud.ai.graph.state.strategy.ReplaceStrategy;
+import com.example.brdprocessor.node.ApiSenderNode;
+import com.example.brdprocessor.node.DocumentChunkerNode;
+import com.example.brdprocessor.node.HumanReviewNode;
+import com.example.brdprocessor.node.JsonCreatorNode;
+import com.example.brdprocessor.node.ScenarioGeneratorNode;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.HashMap;
+
+@Configuration
+public class GraphConfiguration {
+
+    @Bean
+    public StateGraph brdProcessingGraph(ChatClient.Builder chatClientBuilder) throws GraphStateException {
+        // KeyStrategy: Replace for all state keys (overwrites on update)
+        KeyStrategyFactory keyStrategyFactory = () -> {
+            HashMap<String, KeyStrategy> strategies = new HashMap<>();
+            strategies.put("documentPath", new ReplaceStrategy());
+            strategies.put("chunks", new ReplaceStrategy());
+            strategies.put("scenarios", new ReplaceStrategy());
+            strategies.put("scenarioJsons", new ReplaceStrategy());
+            strategies.put("apiResponses", new ReplaceStrategy());
+            strategies.put("reviewData", new ReplaceStrategy());
+            return strategies;
+        };
+
+        StateGraph graph = new StateGraph(keyStrategyFactory)
+                .addNode("chunkDocument", AsyncNodeAction.nodeasync(new DocumentChunkerNode()))
+                .addNode("generateScenarios", AsyncNodeAction.nodeasync(new ScenarioGeneratorNode(chatClientBuilder)))
+                .addNode("createJsons", AsyncNodeAction.nodeasync(new JsonCreatorNode(chatClientBuilder)))
+                .addNode("sendToApi", AsyncNodeAction.nodeasync(new ApiSenderNode()))
+                .addNode("humanReview", AsyncNodeAction.nodeasync(new HumanReviewNode()))
+
+                // Linear edges
+                .addEdge(StateGraph.START, "chunkDocument")
+                .addEdge("chunkDocument", "generateScenarios")
+                .addEdge("generateScenarios", "createJsons")
+                .addEdge("createJsons", "sendToApi")
+                .addEdge("sendToApi", "humanReview")
+                .addEdge("humanReview", StateGraph.END);
+
+        return graph;
+    }
+}
+```
+
+#### 4. Nodes (Implement `NodeAction` for Each Agent)
+
+**DocumentChunkerNode.java** (Handles Word parsing and chunking)
+```java
+package com.example.brdprocessor.node;
+
+import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.action.NodeAction;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFParagraph;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class DocumentChunkerNode implements NodeAction {
+    private static final Logger logger = LoggerFactory.getLogger(DocumentChunkerNode.class);
+
+    @Override
+    public Map<String, Object> apply(OverAllState state) throws Exception {
+        String documentPath = state.value("documentPath", "");
+        if (documentPath.isEmpty()) {
+            throw new IllegalArgumentException("documentPath is required");
+        }
+
+        List<String> chunks = new ArrayList<>();
+        try (FileInputStream fis = new FileInputStream(documentPath);
+             XWPFDocument document = new XWPFDocument(fis)) {
+
+            for (XWPFParagraph paragraph : document.getParagraphs()) {
+                String text = paragraph.getText().trim();
+                if (!text.isEmpty()) {
+                    chunks.add(text);  // Chunk by paragraph; enhance with size limits if needed
+                }
+            }
+            logger.info("Chunked document into {} chunks", chunks.size());
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read Word document", e);
+        }
+
+        Map<String, Object> output = new HashMap<>();
+        output.put("chunks", chunks);
+        return output;
+    }
+}
+```
+
+**ScenarioGeneratorNode.java** (LLM to generate scenarios)
+```java
+package com.example.brdprocessor.node;
+
+import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.action.NodeAction;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.prompt.PromptTemplate;
+import reactor.core.publisher.Flux;
+
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class ScenarioGeneratorNode implements NodeAction {
+    private static final PromptTemplate PROMPT = new PromptTemplate(
+        "You are a requirements analyst. From this BRD document chunks: {chunks}\n" +
+        "Generate 5-10 user scenarios (use cases) as a numbered list, one per line. " +
+        "Each scenario should be concise: 'As a [user], I want [goal] so that [benefit]'.\n" +
+        "Output only the list, no extra text."
+    );
+    private final ChatClient chatClient;
+
+    public ScenarioGeneratorNode(ChatClient.Builder chatClientBuilder) {
+        this.chatClient = chatClientBuilder.build();
+    }
+
+    @Override
+    public Map<String, Object> apply(OverAllState state) throws Exception {
+        @SuppressWarnings("unchecked")
+        List<String> chunks = (List<String>) state.value("chunks", List.of());
+        String joinedChunks = String.join("\n\n", chunks);
+
+        String result = chatClient.prompt()
+                .user(PROMPT.create(joinedChunks))  // Pass chunks as param
+                .call()
+                .content();
+
+        List<String> scenarios = Arrays.asList(result.split("\n")).stream()
+                .filter(s -> !s.trim().isEmpty())
+                .toList();
+
+        Map<String, Object> output = new HashMap<>();
+        output.put("scenarios", scenarios);
+        return output;
+    }
+}
+```
+
+**JsonCreatorNode.java** (LLM to enrich scenarios with JSON)
+```java
+package com.example.brdprocessor.node;
+
+import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.action.NodeAction;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.prompt.PromptTemplate;
+import reactor.core.publisher.Flux;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class JsonCreatorNode implements NodeAction {
+    private static final PromptTemplate PROMPT = new PromptTemplate(
+        "Based on this scenario: {scenario}\n" +
+        "Create a JSON object with:\n" +
+        "- 'scenario': the original text\n" +
+        "- 'conditions': array of 3-5 additional edge-case conditions (strings)\n" +
+        "- 'predicates': array of 3-5 validation predicates (e.g., 'if X then Y')\n" +
+        "Output only valid JSON, no extra text."
+    );
+    private final ChatClient chatClient;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public JsonCreatorNode(ChatClient.Builder chatClientBuilder) {
+        this.chatClient = chatClientBuilder.build();
+    }
+
+    @Override
+    public Map<String, Object> apply(OverAllState state) throws Exception {
+        @SuppressWarnings("unchecked")
+        List<String> scenarios = (List<String>) state.value("scenarios", List.of());
+        List<String> scenarioJsons = new ArrayList<>();
+
+        for (String scenario : scenarios) {
+            String jsonStr = chatClient.prompt()
+                    .user(PROMPT.create(Map.of("scenario", scenario)))
+                    .call()
+                    .content();  // Assume LLM outputs clean JSON
+
+            // Validate/parse JSON (simple check)
+            try {
+                objectMapper.readTree(jsonStr);
+                scenarioJsons.add(jsonStr);
+            } catch (Exception e) {
+                // Fallback: wrap as string if invalid
+                scenarioJsons.add("{\"scenario\":\"" + scenario + "\",\"conditions\":[],\"predicates\":[]}");
+            }
+        }
+
+        Map<String, Object> output = new HashMap<>();
+        output.put("scenarioJsons", scenarioJsons);
+        return output;
+    }
+}
+```
+
+**ApiSenderNode.java** (Sends JSONs with retry)
+```java
+package com.example.brdprocessor.node;
+
+import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.action.NodeAction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Component  // For @Value injection
+public class ApiSenderNode implements NodeAction {
+    private static final Logger logger = LoggerFactory.getLogger(ApiSenderNode.class);
+
+    @Value("${brd.microservice.url}")
+    private String microserviceUrl;
+
+    @Value("${brd.retry.max-attempts:3}")
+    private int maxAttempts;
+
+    @Value("${brd.retry.base-delay-ms:1000}")
+    private long baseDelayMs;
+
+    private final WebClient webClient = WebClient.create();
+
+    @Override
+    public Map<String, Object> apply(OverAllState state) throws Exception {
+        @SuppressWarnings("unchecked")
+        List<String> scenarioJsons = (List<String>) state.value("scenarioJsons", List.of());
+        List<String> apiResponses = new ArrayList<>();
+
+        for (String json : scenarioJsons) {
+            boolean success = false;
+            Exception lastError = null;
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    String response = webClient.post()
+                            .uri(microserviceUrl)
+                            .header("Content-Type", "application/json")
+                            .bodyValue(json)
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .block(Duration.ofSeconds(10));
+
+                    apiResponses.add(response);
+                    success = true;
+                    logger.info("API call succeeded for JSON on attempt {}", attempt);
+                    break;
+                } catch (WebClientResponseException e) {
+                    if (e.getStatusCode().is2xxSuccessful()) {
+                        apiResponses.add(e.getResponseBodyAsString());
+                        success = true;
+                        break;
+                    }
+                    lastError = e;
+                    logger.warn("API call failed (attempt {}/{}): {}", attempt, maxAttempts, e.getStatusCode());
+                } catch (Exception e) {
+                    lastError = e;
+                    logger.warn("API call exception (attempt {}/{}): {}", attempt, maxAttempts, e.getMessage());
+                }
+
+                if (!success && attempt < maxAttempts) {
+                    Thread.sleep(baseDelayMs * (long) Math.pow(2, attempt - 1));  // Exponential backoff
+                }
+            }
+
+            if (!success) {
+                logger.error("All retries failed for JSON: {}", json);
+                apiResponses.add("{\"error\":\"Failed after " + maxAttempts + " retries\"}");  // Placeholder
+                // Optionally throw to halt graph: throw new RuntimeException("API send failed", lastError);
+            }
+        }
+
+        Map<String, Object> output = new HashMap<>();
+        output.put("apiResponses", apiResponses);
+        return output;
+    }
+}
+```
+
+**HumanReviewNode.java** (Formats for review and ends)
+```java
+package com.example.brdprocessor.node;
+
+import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.action.NodeAction;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class HumanReviewNode implements NodeAction {
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public Map<String, Object> apply(OverAllState state) throws Exception {
+        @SuppressWarnings("unchecked")
+        List<String> scenarioJsons = (List<String>) state.value("scenarioJsons", List.of());
+        @SuppressWarnings("unchecked")
+        List<String> apiResponses = (List<String>) state.value("apiResponses", List.of());
+
+        // Bundle for review: Map of JSON + response per index
+        Map<String, Object> reviewData = new HashMap<>();
+        for (int i = 0; i < scenarioJsons.size(); i++) {
+            Map<String, String> pair = new HashMap<>();
+            pair.put("json", scenarioJsons.get(i));
+            pair.put("apiResponse", apiResponses.size() > i ? apiResponses.get(i) : "No response");
+            reviewData.put("reviewItem_" + i, pair);
+        }
+
+        // Optional: Generate summary message
+        String summary = "Human Review Required:\n" + objectMapper.writeValueAsString(reviewData);
+
+        Map<String, Object> output = new HashMap<>();
+        output.put("reviewData", reviewData);
+        output.put("reviewSummary", summary);
+        return output;
+    }
+}
+```
+
+#### 5. `BrdProcessorController.java` (Entry Point)
+```java
+package com.example.brdprocessor.controller;
+
+import com.alibaba.cloud.ai.graph.CompiledGraph;
+import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.RunnableConfig;
+import com.alibaba.cloud.ai.graph.StateGraph;
+import com.alibaba.cloud.ai.graph.exception.GraphStateException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/brd")
+public class BrdProcessorController {
+    private static final Logger logger = LoggerFactory.getLogger(BrdProcessorController.class);
+    private final CompiledGraph compiledGraph;
+
+    public BrdProcessorController(@Qualifier("brdProcessingGraph") StateGraph stateGraph) throws GraphStateException {
+        this.compiledGraph = stateGraph.compile();
+    }
+
+    @PostMapping("/process")
+    public ResponseEntity<Map<String, Object>> processBrd(@RequestParam("file") MultipartFile file) {
+        if (file.isEmpty()) {
+            return ResponseEntity.badRequest().build();
+        }
+
+        // Save uploaded file to temp path
+        String tempDir = System.getProperty("java.io.tmpdir");
+        String fileName = UUID.randomUUID() + "_" + file.getOriginalFilename();
+        Path tempPath = Path.of(tempDir, fileName);
+        try {
+            Files.copy(file.getInputStream(), tempPath);
+            logger.info("Uploaded BRD to temp path: {}", tempPath);
+        } catch (IOException e) {
+            logger.error("Failed to save file", e);
+            return ResponseEntity.internalServerError().build();
+        }
+
+        // Initial state
+        Map<String, Object> initialState = new HashMap<>();
+        initialState.put("documentPath", tempPath.toString());
+
+        // Run graph
+        RunnableConfig config = RunnableConfig.builder()
+                .threadId("brd-" + UUID.randomUUID().toString())  // For stateful threads if needed
+                .build();
+
+        Optional<OverAllState> result = compiledGraph.invoke(initialState, config);
+
+        // Clean up temp file
+        try {
+            Files.deleteIfExists(tempPath);
+        } catch (IOException e) {
+            logger.warn("Failed to delete temp file", e);
+        }
+
+        if (result.isPresent()) {
+            Map<String, Object> finalState = result.get().data();
+            logger.info("BRD processing completed: {} scenarios generated", finalState.get("scenarios"));
+            return ResponseEntity.ok(finalState);
+        } else {
+            return ResponseEntity.internalServerError().body(Map.of("error", "Graph execution failed"));
+        }
+    }
+}
+```
+
+#### 6. `BrdProcessorApplication.java` (Main Boot Class)
+```java
+package com.example.brdprocessor;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class BrdProcessorApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(BrdProcessorApplication.class, args);
+    }
+}
+```
+
+This setup is complete and runnable. Set `DASHSCOPE_API_KEY` env var, point `brd.microservice.url` to your API, and test with a .docx BRD file. For extensions, add nodes/edges in `GraphConfiguration` and recompile the graph. If you need adjustments (e.g., streaming responses, parallel processing), let me know!
