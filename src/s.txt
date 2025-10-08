@@ -1,0 +1,173 @@
+Perfect — you’ve explained your system very clearly 👏
+
+Let’s break down your architecture and see how you can design this entire flow using the Model Context Protocol (MCP) — and what components can become tools or graph nodes.
+
+
+---
+
+🧠 Quick recap of your current flow
+
+Here’s what your pipeline does step-by-step:
+
+1. Frontend (JavaScript)
+
+User uploads a BRD document (financial domain).
+
+It’s sent to the backend (Java).
+
+
+
+2. Backend (Java)
+
+Parses the BRD document.
+
+Generates N Scenarios using OpenAI.
+
+Displays them in UI.
+
+On scenario click, sends selected scenario to OpenAI again along with a JSON Template, to structure it.
+
+The formatted JSON is sent to a Microservice that generates Excel output.
+
+User can download Excel or Run test in Jenkins.
+
+Jenkins executes tests and returns Reports.
+
+
+
+
+
+---
+
+🧩 What you can model as MCP Tools
+
+In MCP (Model Context Protocol), each “tool” represents a discrete capability or API function that can be invoked by the model or other agents.
+So your system can be modularized like this:
+
+Step	MCP Tool Name	Function / Purpose
+
+1	upload_document_tool	Handles file upload & validation (BRD/FRD).
+2	parse_document_tool	Extracts structured content (sections, requirements, tables).
+3	scenario_generator_tool	Calls OpenAI to generate N scenarios from BRD.
+4	scenario_detail_tool	Given a scenario ID, fetches or expands details.
+5	json_formatter_tool	Takes scenario + JSON template → produces formatted JSON.
+6	excel_generator_tool	Sends JSON to microservice → returns Excel file.
+7	jenkins_trigger_tool	Calls Jenkins API to run BRT test with Excel.
+8	report_fetch_tool	Fetches run results and displays them in UI.
+9	state_graph_tool	Visualizes data flow or dependencies using a graph (optional but powerful).
+10	rag_refine_tool (optional)	If you use RAG to refine scenarios using previous BRD/FRD pairs.
+
+
+
+---
+
+🧩 Example — how MCP nodes/graph can look
+
+You can represent this as a state graph in your MCP-based app:
+
+[Upload Document]
+       ↓
+[Parse Document]
+       ↓
+[Generate Scenarios]
+       ↓
+[Select Scenario]
+       ↓
+[Format as JSON]
+       ↓
+[Generate Excel]
+       ↓
+[Trigger Jenkins Run]
+       ↓
+[Fetch Report]
+
+Each node can have:
+
+Inputs (e.g., BRD file, Scenario ID, JSON Template)
+
+Outputs (e.g., Parsed data, Scenarios list, Excel file, Report)
+
+Tool Reference (which MCP tool handles it)
+
+Metadata (execution time, logs, status)
+
+
+
+---
+
+⚙️ Example JSON definition of tools (simplified MCP schema)
+
+{
+  "tools": [
+    {
+      "name": "parse_document_tool",
+      "description": "Parses uploaded BRD/FRD document and extracts structured content.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "file_path": { "type": "string" } }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": { "parsed_content": { "type": "string" } }
+      }
+    },
+    {
+      "name": "scenario_generator_tool",
+      "description": "Generates scenarios using OpenAI from parsed BRD content.",
+      "input_schema": { "type": "object", "properties": { "parsed_content": { "type": "string" } } },
+      "output_schema": { "type": "object", "properties": { "scenarios": { "type": "array" } } }
+    }
+  ]
+}
+
+Then your MCP graph connects them like this:
+
+{
+  "graph": [
+    { "from": "parse_document_tool", "to": "scenario_generator_tool" },
+    { "from": "scenario_generator_tool", "to": "json_formatter_tool" },
+    { "from": "json_formatter_tool", "to": "excel_generator_tool" },
+    { "from": "excel_generator_tool", "to": "jenkins_trigger_tool" }
+  ]
+}
+
+
+---
+
+🧠 Bonus idea — AI Orchestration via MCP
+
+Later, you can make the model itself auto-orchestrate:
+
+The MCP “agent” sees a new BRD uploaded.
+
+It automatically calls parse_document_tool.
+
+Then triggers scenario_generator_tool, etc.
+
+You can visualize this workflow dynamically (e.g., via D3.js or Mermaid).
+
+
+
+---
+
+🛠️ Tech stack to implement MCP graph
+
+You can use:
+
+Backend: Java (Spring Boot) MCP server (your logic + tool registration)
+
+Frontend: React / Vue / plain JS → visualize the MCP graph
+
+Graph visualization: D3.js / Mermaid / Cytoscape.js
+
+LLM calls: Through OpenAI Java SDK
+
+Optional orchestration: LangGraph or LangChain4j
+
+
+
+---
+
+Would you like me to show you a diagram or code example of how your MCP graph could look (either visually or in JSON)?
+It’ll make this architecture crystal clear.
+
